@@ -1,9 +1,8 @@
-// Fast drop-in for csv-reader 1.0.0 (make.fun's own CSV reader).
+// Fast drop-in for csv-reader 1.0.0 (make.fun's own CSV reader), round 2.
 // run(input) returns exactly what csv-reader 1.0.0's readCsv returns for the same input,
-// {columns, rows, errors}, but read with one tight left-to-right scan: fields are taken as
-// slices of the text (no per-character string building), and only the broken bits — a stray
-// CR, a doubled quote, a line break inside quotes, junk after a closing quote, a quote that
-// never closes — fall into the careful paths that the reference spells out.
+// {columns, rows, errors}. Round 1's logic, but with the unquoted-field scan inlined into
+// the single flat run() function: no nested helper, so pos/line/ended stay plain locals
+// that V8 keeps in registers instead of a captured context object.
 //
 // The reading policy, as the reference states it:
 // - a U+FEFF at the very start is dropped;
@@ -36,62 +35,9 @@ export function run(input) {
   let line = 1;
   if (n > 0 && text.charCodeAt(0) === 0xFEFF) pos = 1;
 
-  // The record being read: the line it starts on and the index in rows it takes.
   let recordLine = 1;
   let recordRow = null;
-  // How the last field ended: 0 comma (the record goes on), 1 line break, 2 end of text.
   let ended = 0;
-  // Characters kept by the last unquoted read (for the quote_junk check).
-  let unqAdded = 0;
-
-  // Reads an unquoted field starting at `start`, with `acc` as the characters already kept
-  // (null: none yet; '"' for a quote that never closed; the quoted value for quote junk).
-  // Returns the field; sets ended and advances pos/line.
-  function unq(acc, start) {
-    let a = acc;
-    unqAdded = 0;
-    while (pos < n) {
-      const c = text.charCodeAt(pos);
-      if (c === 44) {
-        // ','
-        unqAdded += pos - start;
-        const v = a === null ? text.slice(start, pos) : a + text.slice(start, pos);
-        pos += 1;
-        ended = 0;
-        return v;
-      }
-      if (c === 10) {
-        // '\n'
-        unqAdded += pos - start;
-        const v = a === null ? text.slice(start, pos) : a + text.slice(start, pos);
-        pos += 1;
-        line += 1;
-        ended = 1;
-        return v;
-      }
-      if (c === 13) {
-        // '\r'
-        if (pos + 1 < n && text.charCodeAt(pos + 1) === 10) {
-          unqAdded += pos - start;
-          const v = a === null ? text.slice(start, pos) : a + text.slice(start, pos);
-          pos += 2;
-          line += 1;
-          ended = 1;
-          return v;
-        }
-        errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
-        unqAdded += pos - start;
-        a = (a === null ? '' : a) + text.slice(start, pos);
-        pos += 1; // the CR is dropped; the field goes on
-        start = pos;
-        continue;
-      }
-      pos += 1;
-    }
-    unqAdded += pos - start;
-    ended = 2;
-    return a === null ? text.slice(start, pos) : a + text.slice(start, pos);
-  }
 
   while (true) {
     // Lines with no characters are no records.
@@ -115,7 +61,7 @@ export function run(input) {
     let quoted = false;
     do {
       if (text.charCodeAt(pos) === 34) {
-        // '"' — a quoted field.
+        // A quoted field.
         quoted = true;
         const open = pos;
         const openLine = line;
@@ -138,7 +84,6 @@ export function run(input) {
             break;
           }
           if (c === 13 || c === 10) {
-            // CRLF and a lone CR inside quotes are each one LF.
             value += text.slice(start, pos) + '\n';
             if (c === 13 && pos + 1 < n && text.charCodeAt(pos + 1) === 10) pos += 2;
             else pos += 1;
@@ -154,7 +99,34 @@ export function run(input) {
           pos = open + 1;
           line = openLine;
           errors.push({ code: 'unterminated_quote', line: recordLine, row: recordRow });
-          fields.push(unq('"', pos));
+          // Inlined unquoted scan with the '"' already kept.
+          let a = '"';
+          let s2 = pos;
+          let endKind = -1;
+          for (;;) {
+            if (pos >= n) { endKind = 2; break; }
+            const c = text.charCodeAt(pos);
+            if (c === 44) { endKind = 0; break; }
+            if (c === 10) { endKind = 1; break; }
+            if (c === 13) {
+              if (pos + 1 < n && text.charCodeAt(pos + 1) === 10) { endKind = 1; break; }
+              errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
+              a = a + text.slice(s2, pos);
+              pos += 1;
+              s2 = pos;
+              continue;
+            }
+            pos += 1;
+          }
+          fields.push(a + text.slice(s2, pos));
+          if (endKind === 0) { pos += 1; ended = 0; }
+          else if (endKind === 1) {
+            if (text.charCodeAt(pos) === 13) pos += 2; else pos += 1;
+            line += 1;
+            ended = 1;
+          } else {
+            ended = 2;
+          }
         } else if (pos >= n) {
           fields.push(value);
           ended = 2;
@@ -176,15 +148,70 @@ export function run(input) {
             ended = 1;
           } else {
             // What follows the closing quote is appended as it stands, up to the next
-            // comma or line break.
-            const v = unq(value, pos);
-            if (unqAdded > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
-            fields.push(v);
+            // comma or line break. Inlined unquoted scan with the quoted value kept.
+            let a = value;
+            let s2 = pos;
+            let junkAdded = 0;
+            let endKind = -1;
+            for (;;) {
+              if (pos >= n) { endKind = 2; break; }
+              const c2 = text.charCodeAt(pos);
+              if (c2 === 44) { endKind = 0; break; }
+              if (c2 === 10) { endKind = 1; break; }
+              if (c2 === 13) {
+                if (pos + 1 < n && text.charCodeAt(pos + 1) === 10) { endKind = 1; break; }
+                errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
+                junkAdded += pos - s2;
+                a = a + text.slice(s2, pos);
+                pos += 1;
+                s2 = pos;
+                continue;
+              }
+              pos += 1;
+            }
+            junkAdded += pos - s2;
+            fields.push(a + text.slice(s2, pos));
+            if (junkAdded > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
+            if (endKind === 0) { pos += 1; ended = 0; }
+            else if (endKind === 1) {
+              if (text.charCodeAt(pos) === 13) pos += 2; else pos += 1;
+              line += 1;
+              ended = 1;
+            } else {
+              ended = 2;
+            }
           }
         }
       } else {
+        // An unquoted field. Inlined scan to the next comma or line break.
         quoted = false;
-        fields.push(unq(null, pos));
+        let a = null;
+        let s2 = pos;
+        let endKind = -1;
+        for (;;) {
+          if (pos >= n) { endKind = 2; break; }
+          const c = text.charCodeAt(pos);
+          if (c === 44) { endKind = 0; break; }
+          if (c === 10) { endKind = 1; break; }
+          if (c === 13) {
+            if (pos + 1 < n && text.charCodeAt(pos + 1) === 10) { endKind = 1; break; }
+            errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
+            a = (a === null ? '' : a) + text.slice(s2, pos);
+            pos += 1;
+            s2 = pos;
+            continue;
+          }
+          pos += 1;
+        }
+        fields.push(a === null ? text.slice(s2, pos) : a + text.slice(s2, pos));
+        if (endKind === 0) { pos += 1; ended = 0; }
+        else if (endKind === 1) {
+          if (text.charCodeAt(pos) === 13) pos += 2; else pos += 1;
+          line += 1;
+          ended = 1;
+        } else {
+          ended = 2;
+        }
       }
     } while (ended === 0);
 
